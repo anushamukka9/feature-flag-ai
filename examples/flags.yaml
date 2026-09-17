@@ -1,0 +1,45 @@
+# Example flag store: model rollout configuration
+version: 1
+flags:
+  summarizer-v2:
+    description: Roll out the v2 summarization model
+    enabled: true
+    kill_switch: false
+    rollout_percentage: 25.0
+    variants:
+      control: 50.0
+      summarizer-v2: 50.0
+    targeting_rules:
+      - attribute: plan
+        operator: equals
+        value: enterprise
+        result: true
+        note: enterprise tenants always get the new model
+      - attribute: region
+        operator: equals
+        value: cn
+        result: false
+        note: hold back in regions pending review
+    canary_stages: []
+    canary_stage_index: 0
+    history: []
+  reranker-canary:
+    description: Canary rollout of the new reranker
+    enabled: true
+    kill_switch: false
+    rollout_percentage: 100.0
+    variants: {}
+    targeting_rules: []
+    canary_stages:
+      - name: soak
+        percentage: 1.0
+        note: 1% for the first hour while dashboards are watched
+      - name: ramp
+        percentage: 25.0
+        note: widen once p99 latency is stable
+      - name: full
+        percentage: 100.0
+        note: complete rollout
+    canary_stage_index: 0
+    history: []
+audit: []
