@@ -10,6 +10,9 @@ Examples:
     flag-ai kill new-ranker-v2 --note "p99 latency spike"
     flag-ai history new-ranker-v2
     flag-ai rollback new-ranker-v2 --steps 1
+    flag-ai set-schedule new-ranker-v2 \\
+        --steps "2026-10-01T00:00:00+00:00=5,2026-10-02T00:00:00+00:00=50"
+    flag-ai simulate new-ranker-v2 --subjects 10000
 """
 
 from __future__ import annotations
@@ -19,8 +22,8 @@ import json
 import sys
 from pathlib import Path
 
-from .evaluator import evaluate, subject_id_from
-from .models import CanaryStage, TargetingRule, VALID_OPERATORS
+from .evaluator import evaluate, is_enabled, subject_id_from
+from .models import CanaryStage, RuleCondition, ScheduleStage, TargetingRule, VALID_OPERATORS
 from .store import FlagStore
 
 DEFAULT_STORE = "flags.yaml"
@@ -62,6 +65,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 ],
                 "canary_stages": [],
                 "canary_stage_index": 0,
+                "rollout_schedule": [],
                 "history": [],
             }
         },
@@ -88,9 +92,15 @@ def cmd_list(args: argparse.Namespace) -> int:
         state = "ON " if flag.enabled and not flag.kill_switch else "OFF"
         if flag.kill_switch:
             state = "KILLED"
+        if flag.rollout_schedule:
+            mode = "sched"
+        elif flag.canary_stages:
+            mode = "canary"
+        else:
+            mode = "manual"
         print(
             f"{state}  {flag.key}  "
-            f"rollout={flag.effective_percentage():g}%  "
+            f"rollout={flag.effective_percentage():g}%[{mode}]  "
             f"rules={len(flag.targeting_rules)}  "
             f"variants={','.join(flag.variants) or '-'}"
         )
@@ -158,22 +168,67 @@ def cmd_set_variants(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_value(raw: str):
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+
+
 def cmd_add_rule(args: argparse.Namespace) -> int:
     store = FlagStore(args.store)
-    try:
-        value = json.loads(args.value)
-    except (json.JSONDecodeError, ValueError):
-        value = args.value
-    rule = TargetingRule(
-        attribute=args.attribute,
-        operator=args.operator,
-        value=value,
-        result=args.result == "on",
-        note=args.note or "",
-    )
+    conditions: list[RuleCondition] = []
+    if args.attribute is not None:
+        if args.operator is None or args.value is None:
+            raise ValueError("--attribute requires --operator and --value")
+        conditions.append(
+            RuleCondition(args.attribute, args.operator, _parse_value(args.value))
+        )
+    for spec in args.condition or []:
+        conditions.append(_parse_condition(spec))
+    if not conditions:
+        raise ValueError(
+            "pass --attribute/--operator/--value or at least one --condition"
+        )
+    result = args.result == "on"
+    if len(conditions) == 1:
+        cond = conditions[0]
+        rule = TargetingRule(
+            attribute=cond.attribute,
+            operator=cond.operator,
+            value=cond.value,
+            result=result,
+            note=args.note or "",
+        )
+    else:
+        # Composite rule: the first condition's attribute doubles as the
+        # display label; the conditions list carries the real logic.
+        rule = TargetingRule(
+            attribute=conditions[0].attribute,
+            operator="equals",
+            result=result,
+            note=args.note or "",
+            conditions=conditions,
+            match=args.match,
+        )
     store.add_rule(args.key, rule, actor=args.actor, note=args.note or "")
-    print(f"added rule to {args.key!r}: {args.attribute} {args.operator} {value!r}")
+    desc = " + ".join(
+        f"{c.attribute} {c.operator} {c.value!r}" for c in conditions
+    )
+    print(f"added rule to {args.key!r} (match={args.match}): {desc}")
     return 0
+
+
+def _parse_condition(spec: str) -> RuleCondition:
+    """Parse a composite-rule condition written as attribute:operator:value."""
+    parts = spec.split(":", 2)
+    if len(parts) != 3 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError(
+            f"bad condition {spec!r}; use attribute:operator:value, "
+            "e.g. plan:equals:enterprise"
+        )
+    attribute, operator, raw = (p.strip() for p in parts)
+    return RuleCondition(attribute, operator, _parse_value(raw))
 
 
 def cmd_remove_rule(args: argparse.Namespace) -> int:
@@ -211,6 +266,48 @@ def cmd_set_canary(args: argparse.Namespace) -> int:
         )
     store.set_canary(args.key, stages, actor=args.actor, note=args.note or "")
     print(f"{args.key!r} canary plan -> {[s.name for s in stages]}")
+    return 0
+
+
+def cmd_set_schedule(args: argparse.Namespace) -> int:
+    store = FlagStore(args.store)
+    stages = []
+    for chunk in args.steps.split(","):
+        starts_at, _, pct = chunk.partition("=")
+        stages.append(
+            ScheduleStage(starts_at=starts_at.strip(), percentage=float(pct.strip()))
+        )
+    store.set_schedule(args.key, stages, actor=args.actor, note=args.note or "")
+    print(f"{args.key!r} schedule -> {len(stages)} stage(s)")
+    for stage in sorted(stages, key=lambda s: s.starts_at_dt()):
+        print(f"  {stage.starts_at} -> {stage.percentage:g}%")
+    return 0
+
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    """Evaluate a flag across N synthetic subjects and show the split."""
+    from collections import Counter
+
+    store = FlagStore(args.store)
+    flag = store.get(args.key)
+    base = _parse_context(args.base_context) if args.base_context else {}
+    subjects = args.subjects
+    on = 0
+    variants = Counter()
+    for i in range(subjects):
+        ctx = dict(base)
+        ctx.setdefault("user_id", f"sim-user-{i}")
+        result = evaluate(flag, ctx, args.now)
+        if result.enabled:
+            on += 1
+            variants[result.variant or "-"] += 1
+    print(f"flag: {args.key}  subjects: {subjects}")
+    print(f"effective rollout: {flag.effective_percentage(args.now):g}%")
+    print(f"enabled: {on}/{subjects} ({100.0 * on / subjects:.1f}%)")
+    if variants:
+        print("variants:")
+        for name, count in sorted(variants.items()):
+            print(f"  {name}: {count} ({100.0 * count / on:.1f}% of enabled)")
     return 0
 
 
@@ -282,7 +379,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("remove-rule", "remove a targeting rule", cmd_remove_rule),
         ("evaluate", "evaluate a flag for a context", cmd_evaluate),
         ("set-canary", "define a canary stage plan", cmd_set_canary),
+        ("set-schedule", "define a time-based rollout schedule", cmd_set_schedule),
         ("canary-advance", "advance to the next canary stage", cmd_canary_advance),
+        ("simulate", "simulate evaluation across N subjects", cmd_simulate),
         ("history", "show a flag's change history", cmd_history),
         ("rollback", "roll a flag back to an earlier snapshot", cmd_rollback),
         ("audit", "show the store-wide audit log", cmd_audit),
@@ -292,14 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
         if name in {
             "create", "show", "enable", "disable", "kill", "unkill",
             "set-rollout", "set-variants", "add-rule", "remove-rule",
-            "evaluate", "set-canary", "canary-advance", "history", "rollback",
+            "evaluate", "set-canary", "set-schedule", "canary-advance",
+            "history", "rollback", "simulate",
         }:
             sp.add_argument("key", help="flag key")
         if name == "create":
             sp.add_argument("--description", default="")
         if name in {"enable", "disable", "kill", "unkill", "set-rollout",
                     "set-variants", "add-rule", "remove-rule", "set-canary",
-                    "canary-advance"}:
+                    "set-schedule", "canary-advance"}:
             sp.add_argument("--note", default="")
         if name == "set-rollout":
             sp.add_argument("--percentage", type=float, required=True)
@@ -307,11 +407,18 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--weights", required=True,
                             help="e.g. control=50,model-a=50")
         if name == "add-rule":
-            sp.add_argument("--attribute", required=True)
-            sp.add_argument("--operator", required=True, choices=sorted(VALID_OPERATORS))
-            sp.add_argument("--value", required=True,
+            sp.add_argument("--attribute",
+                            help="single-condition rule attribute "
+                                 "(or use --condition for composites)")
+            sp.add_argument("--operator", choices=sorted(VALID_OPERATORS))
+            sp.add_argument("--value",
                             help="JSON-parsed when possible, else a string")
             sp.add_argument("--result", required=True, choices=["on", "off"])
+            sp.add_argument("--condition", action="append", default=[],
+                            help="composite condition as attribute:operator:value "
+                                 "(repeatable)")
+            sp.add_argument("--match", choices=["all", "any"], default="all",
+                            help="how multiple conditions combine (default: all)")
         if name == "remove-rule":
             sp.add_argument("--index", type=int, required=True)
         if name == "evaluate":
@@ -320,6 +427,17 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "set-canary":
             sp.add_argument("--stages", required=True,
                             help="e.g. soak=1,ramp=10,full=100")
+        if name == "set-schedule":
+            sp.add_argument("--steps", required=True,
+                            help='e.g. "2026-10-01T00:00:00+00:00=5,'
+                                 '2026-10-02T00:00:00+00:00=25"')
+        if name == "simulate":
+            sp.add_argument("--subjects", type=int, default=1000,
+                            help="number of synthetic subjects (default: 1000)")
+            sp.add_argument("--base-context", default=None,
+                            help="JSON object merged into every subject context")
+            sp.add_argument("--now", default=None,
+                            help="pin evaluation time (ISO-8601) for schedules")
         if name == "rollback":
             sp.add_argument("--steps", type=int, default=1)
         sp.set_defaults(func=func)

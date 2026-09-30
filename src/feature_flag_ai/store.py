@@ -18,6 +18,7 @@ The store file looks like::
             value: enterprise
             result: true
             note: enterprise tenants get it first
+        rollout_schedule: []
         canary_stages: []
         canary_stage_index: 0
         history: []
@@ -29,6 +30,8 @@ The store file looks like::
         note: ...
 
 Every mutation records an audit entry and snapshots the flag for rollback.
+A flag uses exactly one rollout mode at a time: a time-based schedule, a
+canary plan, or a manual percentage. Setting one clears the others.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .audit import AuditEntry, record_change, rollback, snapshot_for_rollback, utcnow_iso
-from .models import Flag
+from .models import Flag, ScheduleStage
 
 try:
     import yaml  # type: ignore
@@ -154,9 +157,11 @@ class FlagStore:
     ) -> Flag:
         def _apply(f: Flag) -> None:
             f.rollout_percentage = float(percentage)
-            # A manual rollout percentage supersedes an active canary plan.
+            # A manual rollout percentage supersedes active canary plans
+            # and time-based schedules.
             f.canary_stages = []
             f.canary_stage_index = 0
+            f.rollout_schedule = []
 
         return self._mutate(key, "set_rollout", actor, note, _apply)
 
@@ -190,11 +195,36 @@ class FlagStore:
         from .models import CanaryStage
 
         parsed = [s if isinstance(s, CanaryStage) else CanaryStage(**s) for s in stages]
-        return self._mutate(
-            key, "set_canary", actor, note,
-            lambda f: (setattr(f, "canary_stages", parsed),
-                       setattr(f, "canary_stage_index", 0)),
-        )
+
+        def _apply(f: Flag) -> None:
+            # A canary plan supersedes a time-based schedule.
+            f.rollout_schedule = []
+            f.canary_stages = parsed
+            f.canary_stage_index = 0
+
+        return self._mutate(key, "set_canary", actor, note, _apply)
+
+    def set_schedule(self, key: str, stages, actor: str, note: str = "") -> Flag:
+        """Set a time-based rollout schedule (clears canary/manual modes).
+
+        ``stages`` is a list of ``ScheduleStage`` (or dicts with
+        ``starts_at``/``percentage``/``note``); stages are sorted by
+        ``starts_at`` before being stored.
+        """
+        parsed = [
+            s if isinstance(s, ScheduleStage) else ScheduleStage(**s) for s in stages
+        ]
+        if not parsed:
+            raise ValueError("a rollout schedule needs at least one stage")
+        parsed.sort(key=lambda s: s.starts_at_dt())
+
+        def _apply(f: Flag) -> None:
+            # A schedule supersedes canary plans and manual percentages.
+            f.canary_stages = []
+            f.canary_stage_index = 0
+            f.rollout_schedule = parsed
+
+        return self._mutate(key, "set_schedule", actor, note, _apply)
 
     def advance_canary(self, key: str, actor: str, note: str = "") -> Flag:
         def _apply(f: Flag) -> None:

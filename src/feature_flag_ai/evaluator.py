@@ -12,7 +12,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from .models import Flag, TargetingRule
+from .models import Flag, RuleCondition, TargetingRule
 
 BUCKET_MODULUS = 100_000
 
@@ -50,41 +50,60 @@ def subject_id_from(context: Mapping[str, Any]) -> str:
     return "anonymous"
 
 
-def rule_matches(rule: TargetingRule, context: Mapping[str, Any]) -> bool:
-    """Check whether a targeting rule's condition holds for the context."""
-    actual = context.get(rule.attribute, _MISSING)
-    if actual is _MISSING:
-        return False
-    op = rule.operator
-    expected = rule.value
-    if op == "equals":
-        return actual == expected
-    if op == "not_equals":
-        return actual != expected
-    if op == "in":
-        return actual in expected
-    if op == "not_in":
-        return actual not in expected
-    if op == "contains":
-        return expected in actual
-    if op == "gt":
-        return actual > expected
-    if op == "gte":
-        return actual >= expected
-    if op == "lt":
-        return actual < expected
-    if op == "lte":
-        return actual <= expected
-    if op == "startswith":
-        return str(actual).startswith(str(expected))
-    raise ValueError(f"unknown operator {op!r}")
-
-
 class _Missing:
     pass
 
 
 _MISSING = _Missing()
+
+
+def _compare(operator: str, actual: Any, expected: Any) -> bool:
+    if operator == "equals":
+        return actual == expected
+    if operator == "not_equals":
+        return actual != expected
+    if operator == "in":
+        return actual in expected
+    if operator == "not_in":
+        return actual not in expected
+    if operator == "contains":
+        return expected in actual
+    if operator == "gt":
+        return actual > expected
+    if operator == "gte":
+        return actual >= expected
+    if operator == "lt":
+        return actual < expected
+    if operator == "lte":
+        return actual <= expected
+    if operator == "startswith":
+        return str(actual).startswith(str(expected))
+    raise ValueError(f"unknown operator {operator!r}")
+
+
+def condition_matches(condition: RuleCondition, context: Mapping[str, Any]) -> bool:
+    """Check whether one rule condition holds for the context."""
+    actual = context.get(condition.attribute, _MISSING)
+    if actual is _MISSING:
+        return False
+    return _compare(condition.operator, actual, condition.value)
+
+
+def rule_matches(rule: TargetingRule, context: Mapping[str, Any]) -> bool:
+    """Check whether a targeting rule's condition holds for the context.
+
+    Simple rules test the classic attribute/operator/value triple; composite
+    rules test every condition and combine them with ``match`` ("all" needs
+    every condition to hold, "any" needs at least one).
+    """
+    if rule.conditions:
+        results = [condition_matches(c, context) for c in rule.conditions]
+        if rule.match == "any":
+            return any(results)
+        return all(results)
+    return condition_matches(
+        RuleCondition(rule.attribute, rule.operator, rule.value), context
+    )
 
 
 def pick_variant(flag: Flag, subject_id: str) -> Optional[str]:
@@ -108,8 +127,17 @@ def pick_variant(flag: Flag, subject_id: str) -> Optional[str]:
     return next(reversed(flag.variants))
 
 
-def evaluate(flag: Flag, context: Mapping[str, Any]) -> Evaluation:
-    """Evaluate a flag for a context; returns enabled state + variant."""
+def evaluate(
+    flag: Flag, context: Mapping[str, Any], now: Any = None
+) -> Evaluation:
+    """Evaluate a flag for a context; returns enabled state + variant.
+
+    ``now`` pins the evaluation time for flags with a rollout schedule
+    (ISO-8601 string or datetime; defaults to the current UTC time).
+    Evaluation order: kill switch -> enabled -> targeting rules (first
+    match wins) -> percentage gate (schedule / canary stage / rollout) ->
+    variant assignment.
+    """
     subject = subject_id_from(context)
 
     if flag.kill_switch:
@@ -123,14 +151,14 @@ def evaluate(flag: Flag, context: Mapping[str, Any]) -> Evaluation:
             if rule.result:
                 return Evaluation(
                     flag.key, True, pick_variant(flag, subject),
-                    f"targeting_rule_matched:{rule.attribute}", subject,
+                    f"targeting_rule_matched:{rule.label}", subject,
                 )
             return Evaluation(
                 flag.key, False, None,
-                f"targeting_rule_matched:{rule.attribute}", subject,
+                f"targeting_rule_matched:{rule.label}", subject,
             )
 
-    percentage = flag.effective_percentage()
+    percentage = flag.effective_percentage(now)
     if percentage <= 0:
         return Evaluation(flag.key, False, None, "rollout_percentage_zero", subject)
     if percentage >= 100:
@@ -147,11 +175,13 @@ def evaluate(flag: Flag, context: Mapping[str, Any]) -> Evaluation:
     return Evaluation(flag.key, False, None, "percentage_bucket_miss", subject)
 
 
-def is_enabled(flag: Flag, context: Mapping[str, Any]) -> bool:
+def is_enabled(flag: Flag, context: Mapping[str, Any], now: Any = None) -> bool:
     """Convenience wrapper: just the boolean gate."""
-    return evaluate(flag, context).enabled
+    return evaluate(flag, context, now).enabled
 
 
-def variant(flag: Flag, context: Mapping[str, Any]) -> Optional[str]:
+def variant(
+    flag: Flag, context: Mapping[str, Any], now: Any = None
+) -> Optional[str]:
     """Convenience wrapper: the assigned variant (None when disabled)."""
-    return evaluate(flag, context).variant
+    return evaluate(flag, context, now).variant

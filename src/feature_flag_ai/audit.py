@@ -3,8 +3,8 @@
 Every mutation goes through :class:`FlagStore` and is recorded twice:
 
 * The flag's own ``history`` keeps a snapshot of the flag definition taken
-  *before* the change (bounded to the last 25 entries), which is what
-  :func:`rollback` restores.
+  *before* the change (bounded to the last 25 entries); :func:`rollback`
+  restores it.
 * The store-wide audit log appends an :class:`AuditEntry` with actor,
   timestamp, action and the flag key.
 """
@@ -95,5 +95,6 @@ def rollback(flag, steps: int = 1) -> dict[str, Any]:
     flag.targeting_rules = restored.targeting_rules
     flag.canary_stages = restored.canary_stages
     flag.canary_stage_index = restored.canary_stage_index
+    flag.rollout_schedule = restored.rollout_schedule
     del flag.history[-steps:]
     return record

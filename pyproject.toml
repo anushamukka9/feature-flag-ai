@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feature-flag-ai"
-version = "0.1.0"
+version = "0.2.0"
 description = "Feature flags for safe AI model rollouts: percentage rollouts, canaries, kill switches, targeting rules, rollback history"
 readme = "README.md"
 license = { text = "MIT" }
