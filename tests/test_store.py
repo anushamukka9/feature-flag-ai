@@ -133,3 +133,96 @@ def test_store_round_trip_json(tmp_path):
     reloaded = FlagStore(path)
     assert "j1" in [f.key for f in reloaded.list_flags()]
     assert json.loads(path.read_text())["flags"]["j1"]["key"] == "j1"
+
+
+def test_set_schedule(store):
+    store.create("f1")
+    store.set_schedule(
+        "f1",
+        [
+            {"starts_at": "2026-10-02T00:00:00+00:00", "percentage": 50.0},
+            {"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 10.0},
+        ],
+        actor="a",
+    )
+    flag = store.get("f1")
+    # stages are stored sorted by starts_at
+    assert [s.percentage for s in flag.rollout_schedule] == [10.0, 50.0]
+    assert flag.effective_percentage("2026-10-01T12:00:00+00:00") == 10.0
+    assert store.audit[-1].action == "set_schedule"
+
+
+def test_set_schedule_requires_at_least_one_stage(store):
+    store.create("f1")
+    with pytest.raises(ValueError):
+        store.set_schedule("f1", [], actor="a")
+
+
+def test_set_schedule_clears_canary(store):
+    store.create("f1")
+    store.set_canary("f1", [{"name": "soak", "percentage": 1.0}], actor="a")
+    store.set_schedule(
+        "f1",
+        [{"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 10.0}],
+        actor="a",
+    )
+    flag = store.get("f1")
+    assert flag.canary_stages == []
+    assert len(flag.rollout_schedule) == 1
+
+
+def test_set_canary_clears_schedule(store):
+    store.create("f1")
+    store.set_schedule(
+        "f1",
+        [{"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 10.0}],
+        actor="a",
+    )
+    store.set_canary("f1", [{"name": "soak", "percentage": 1.0}], actor="a")
+    flag = store.get("f1")
+    assert flag.rollout_schedule == []
+    assert len(flag.canary_stages) == 1
+
+
+def test_set_rollout_clears_schedule(store):
+    store.create("f1")
+    store.set_schedule(
+        "f1",
+        [{"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 10.0}],
+        actor="a",
+    )
+    store.set_rollout("f1", 30.0, actor="a")
+    assert store.get("f1").rollout_schedule == []
+    assert store.get("f1").effective_percentage() == 30.0
+
+
+def test_rollback_restores_schedule(store):
+    store.create("f1")
+    store.set_rollout("f1", 10.0, actor="a")
+    store.set_schedule(
+        "f1",
+        [{"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 25.0}],
+        actor="a",
+    )
+    assert len(store.get("f1").rollout_schedule) == 1
+    store.rollback_flag("f1", steps=1, actor="a")
+    flag = store.get("f1")
+    assert flag.rollout_schedule == []
+    assert flag.rollout_percentage == 10.0
+
+
+def test_schedule_round_trip_yaml(tmp_path):
+    path = tmp_path / "flags.yaml"
+    store = FlagStore(path)
+    store.create("f1", actor="a")
+    store.set_schedule(
+        "f1",
+        [{"starts_at": "2026-10-01T00:00:00+00:00", "percentage": 10.0,
+          "note": "soak"}],
+        actor="a",
+    )
+    reloaded = FlagStore(path)
+    stages = reloaded.get("f1").rollout_schedule
+    assert len(stages) == 1
+    assert stages[0].starts_at == "2026-10-01T00:00:00+00:00"
+    assert stages[0].note == "soak"

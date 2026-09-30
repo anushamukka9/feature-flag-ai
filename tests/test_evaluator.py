@@ -143,3 +143,126 @@ def test_canary_stage_overrides_rollout_percentage():
     assert flag.effective_percentage() == 1.0
     on = sum(is_enabled(flag, {"user_id": f"c-{i}"}) for i in range(2000))
     assert on / 2000 < 0.10  # soak stage ~1%
+
+
+def _schedule_flag(**kwargs):
+    from feature_flag_ai.models import ScheduleStage
+
+    stages = [
+        ScheduleStage("2026-10-01T09:00:00+00:00", 5.0),
+        ScheduleStage("2026-10-01T18:00:00+00:00", 50.0),
+    ]
+    kwargs.setdefault("rollout_schedule", stages)
+    return Flag(key="sched-flag", **kwargs)
+
+
+def test_schedule_effective_percentage_over_time():
+    flag = _schedule_flag()
+    assert flag.effective_percentage("2026-10-01T08:00:00+00:00") == 0.0
+    assert flag.effective_percentage("2026-10-01T12:00:00+00:00") == 5.0
+    assert flag.effective_percentage("2026-10-02T00:00:00+00:00") == 50.0
+
+
+def test_schedule_evaluation_uses_pinned_time():
+    flag = _schedule_flag()
+    ctx = {"user_id": "sched-user-1"}
+    # Before the first stage the rollout has not started: nobody passes.
+    assert not is_enabled(flag, ctx, "2026-10-01T08:00:00+00:00")
+    # During the 5% stage only ~5% pass; the result is deterministic.
+    on = sum(
+        is_enabled(flag, {"user_id": f"su-{i}"}, "2026-10-01T12:00:00+00:00")
+        for i in range(2000)
+    )
+    assert 0.02 <= on / 2000 <= 0.08
+    # Same subject sticks to the same decision at the same timestamp.
+    first = is_enabled(flag, ctx, "2026-10-01T12:00:00+00:00")
+    assert is_enabled(flag, ctx, "2026-10-01T12:00:00+00:00") == first
+
+
+def test_schedule_beats_rollout_percentage():
+    flag = _schedule_flag(rollout_percentage=100.0)
+    assert flag.effective_percentage("2026-10-01T08:00:00+00:00") == 0.0
+
+
+def test_schedule_and_canary_are_mutually_exclusive():
+    from feature_flag_ai.models import CanaryStage, ScheduleStage
+
+    with pytest.raises(ValueError):
+        Flag(
+            key="bad",
+            rollout_schedule=[ScheduleStage("2026-10-01T00:00:00+00:00", 10.0)],
+            canary_stages=[CanaryStage("soak", 1.0)],
+        )
+
+
+def test_schedule_stage_rejects_bad_timestamp():
+    from feature_flag_ai.models import ScheduleStage
+
+    with pytest.raises(ValueError):
+        ScheduleStage("not-a-timestamp", 10.0)
+
+
+def test_composite_rule_match_all():
+    from feature_flag_ai.models import RuleCondition
+
+    rule = TargetingRule(
+        conditions=[
+            RuleCondition("plan", "equals", "enterprise"),
+            RuleCondition("region", "equals", "us"),
+        ],
+        match="all",
+        result=True,
+    )
+    flag = make_flag(rollout_percentage=0.0, targeting_rules=[rule])
+    assert is_enabled(flag, {"user_id": "u1", "plan": "enterprise", "region": "us"})
+    assert not is_enabled(flag, {"user_id": "u2", "plan": "enterprise", "region": "eu"})
+    assert not is_enabled(flag, {"user_id": "u3", "plan": "free", "region": "us"})
+
+
+def test_composite_rule_match_any():
+    from feature_flag_ai.models import RuleCondition
+
+    rule = TargetingRule(
+        conditions=[
+            RuleCondition("plan", "equals", "enterprise"),
+            RuleCondition("email", "contains", "@example.com"),
+        ],
+        match="any",
+        result=True,
+    )
+    flag = make_flag(rollout_percentage=0.0, targeting_rules=[rule])
+    assert is_enabled(flag, {"user_id": "u1", "email": "a@example.com"})
+    assert is_enabled(flag, {"user_id": "u2", "plan": "enterprise"})
+    assert not is_enabled(flag, {"user_id": "u3", "plan": "free"})
+
+
+def test_composite_rule_bad_match_mode_rejected():
+    from feature_flag_ai.models import RuleCondition
+
+    with pytest.raises(ValueError):
+        TargetingRule(
+            conditions=[RuleCondition("plan", "equals", "x")],
+            match="sometimes",
+            result=True,
+        )
+
+
+def test_composite_rule_round_trip():
+    from feature_flag_ai.models import RuleCondition
+
+    rule = TargetingRule(
+        attribute="plan",
+        conditions=[
+            RuleCondition("plan", "equals", "enterprise"),
+            RuleCondition("region", "in", ["us", "eu"]),
+        ],
+        match="all",
+        result=True,
+        note="composite",
+    )
+    rebuilt = TargetingRule.from_dict(rule.to_dict())
+    assert rebuilt.match == "all"
+    assert len(rebuilt.conditions) == 2
+    assert rebuilt.conditions[1].operator == "in"
+    assert rule_matches(rebuilt, {"plan": "enterprise", "region": "eu"})
+    assert not rule_matches(rebuilt, {"plan": "enterprise", "region": "cn"})

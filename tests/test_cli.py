@@ -95,3 +95,64 @@ def test_cli_unknown_flag(store):
     run_cli("init", store=store)
     out = run_cli("show", "missing", store=store)
     assert out.returncode == 1
+
+
+def test_cli_set_schedule_and_simulate(store):
+    assert run_cli("init", store=store).returncode == 0
+    assert run_cli("create", "sched", store=store).returncode == 0
+    assert run_cli(
+        "set-schedule", "sched",
+        "--steps", "2026-10-01T00:00:00+00:00=10,2026-10-02T00:00:00+00:00=100",
+        store=store,
+    ).returncode == 0
+
+    # At full rollout every simulated subject is enabled.
+    out = run_cli(
+        "simulate", "sched", "--subjects", "500",
+        "--now", "2026-10-03T00:00:00+00:00", store=store,
+    )
+    assert out.returncode == 0
+    assert "enabled: 500/500" in out.stdout
+
+    # Before the first stage nobody is enabled.
+    out = run_cli(
+        "simulate", "sched", "--subjects", "500",
+        "--now", "2026-09-30T00:00:00+00:00", store=store,
+    )
+    assert out.returncode == 0
+    assert "enabled: 0/500" in out.stdout
+
+
+def test_cli_composite_add_rule(store):
+    assert run_cli("init", store=store).returncode == 0
+    assert run_cli("create", "comp", store=store).returncode == 0
+    # Zero the rollout so only the composite rule can enable the flag.
+    assert run_cli("set-rollout", "comp", "--percentage", "0",
+                   store=store).returncode == 0
+    assert run_cli(
+        "add-rule", "comp",
+        "--condition", "plan:equals:enterprise",
+        "--condition", "region:equals:us",
+        "--match", "all", "--result", "on", store=store,
+    ).returncode == 0
+
+    out = run_cli(
+        "evaluate", "comp",
+        "--context", json.dumps({"user_id": "u1", "plan": "enterprise", "region": "us"}),
+        store=store,
+    )
+    assert json.loads(out.stdout)["enabled"] is True
+
+    out = run_cli(
+        "evaluate", "comp",
+        "--context", json.dumps({"user_id": "u2", "plan": "enterprise", "region": "eu"}),
+        store=store,
+    )
+    assert json.loads(out.stdout)["enabled"] is False
+
+
+def test_cli_add_rule_needs_condition_or_triple(store):
+    assert run_cli("init", store=store).returncode == 0
+    assert run_cli("create", "comp2", store=store).returncode == 0
+    out = run_cli("add-rule", "comp2", "--result", "on", store=store)
+    assert out.returncode == 1
